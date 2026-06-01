@@ -174,7 +174,9 @@ pip install libero-benchmark  # LIBERO env
 pip install robottwin          # RoboTwin env (optional)
 
 # 3. Download an SFT VLA model checkpoint
-# OpenVLA-OFT: https://huggingface.co/collections/openvla/simplevla-rl
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Haozhan72/Openvla-oft-SFT-libero-spatial-traj1
+# OpenVLA-OFT: https://huggingface.co/Haozhan72/Openvla-oft-SFT-libero-spatial-traj1
 # Or train your own SFT model first
 
 # 4. Run GRPO RL training on LIBERO
