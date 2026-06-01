@@ -1,5 +1,7 @@
 # AReaL-VLA: SimpleVLA-RL in AReaL
 
+**WORK IN PROGRESS**
+
 This repository ports **SimpleVLA-RL** (ICLR 2026) from its original veRL backend into
 **AReaL** — Ant Group / Tsinghua's fully-asynchronous RL infrastructure.
 
@@ -183,25 +185,4 @@ python examples/robot/libero_rl.py \
     model.path=/path/to/openvla_oft_sft \
     scheduler.type=local \
     cluster.n_gpus_per_node=8
-```
-
----
-
-## Citation
-
-If you use this work, please cite both SimpleVLA-RL and AReaL:
-
-```bibtex
-@inproceedings{simplevlarl2026,
-  title  = {SimpleVLA-RL: Scaling VLA Training via Reinforcement Learning},
-  author = {...},
-  booktitle = {ICLR 2026},
-}
-
-@misc{fu2025areal,
-  title  = {AReaL: A Large-Scale Asynchronous Reinforcement Learning System},
-  author = {Wei Fu and others},
-  year   = {2025},
-  eprint = {2505.24298},
-}
 ```
