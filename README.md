@@ -163,10 +163,8 @@ AReaL-VLA/
 ## Quickstart
 
 ```bash
-# 1. Clone AReaL and overlay VLA additions
-git clone https://github.com/areal-project/AReaL
-cp -r AReaL-VLA/areal/* AReaL/areal/
-cp -r AReaL-VLA/examples/robot AReaL/examples/
+# 1. Clone AReaL-VLA
+git clone https://github.com/Intelligent-Cloud-Infrastructure-Lab/AReaL-VLA
 
 # 2. Install AReaL + robot sim dependencies
 cd AReaL
