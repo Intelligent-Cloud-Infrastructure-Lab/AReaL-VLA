@@ -75,6 +75,11 @@ class VLAStepRequest:
     # Optional: pre-encoded image token IDs (used when the model tokenises images)
     image_token_ids: list[int] | None = None
 
+    # Raw instruction text forwarded to VLAInferenceServer so it can tokenise
+    # using its own processor (transformers-openvla-oft fork in SimpleVLA env).
+    # Leave None when using VLALocalEngine in the same environment.
+    instruction_text: str | None = None
+
 
 @dataclass
 class VLAStepResponse:
@@ -96,6 +101,13 @@ class VLAStepResponse:
 
     # Weight version at the time of generation (for off-policy staleness tracking)
     output_versions: list[int]
+
+    # Pre-decoded continuous action returned by VLAInferenceServer.
+    # When set, VLARobotWorkflow uses this for env.step() directly instead of
+    # calling action_decoder(output_tokens) — the server already decoded using
+    # the model's norm_stats in the SimpleVLA environment.
+    # None when using VLALocalEngine (decoding happens locally).
+    decoded_action: "np.ndarray | None" = None
 
     @property
     def input_len(self) -> int:
@@ -357,6 +369,7 @@ class VLARobotWorkflow(RolloutWorkflow):
                 image=image,
                 image_token_ids=image_token_ids,
                 max_new_tokens=self.action_chunk_len,
+                instruction_text=instruction,  # for VLAInferenceServer
             )
 
             # 3c. Generate action tokens (async, does not block training) ---
@@ -367,10 +380,17 @@ class VLARobotWorkflow(RolloutWorkflow):
                 break
 
             # 3d. Decode action tokens → continuous action -----------------
+            # VLAInferenceServer pre-decodes actions using model norm_stats in
+            # the SimpleVLA env and returns decoded_action directly.
+            # VLALocalEngine (same-env) leaves decoded_action=None, so we fall
+            # back to the local action_decoder.
             try:
-                action: np.ndarray = await loop.run_in_executor(
-                    None, self.action_decoder, resp.output_tokens
-                )
+                if resp.decoded_action is not None:
+                    action: np.ndarray = resp.decoded_action
+                else:
+                    action = await loop.run_in_executor(
+                        None, self.action_decoder, resp.output_tokens
+                    )
             except Exception as exc:
                 logger.warning(f"[VLARobotWorkflow] action decode failed: {exc}")
                 break
