@@ -185,4 +185,10 @@ python examples/robot/libero_rl.py \
     model.path=/path/to/openvla_oft_sft \
     scheduler.type=local \
     cluster.n_gpus_per_node=8
+
+#5. Run evaluation on LIBERO
+python examples/robot/eval_libero.py \
+    --model_path Haozhan72/Openvla-oft-SFT-libero-spatial-traj1 \
+    --benchmark libero_spatial \
+    --n_episodes_per_task 20
 ```
