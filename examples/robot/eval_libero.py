@@ -204,7 +204,7 @@ def run_episode(
     """
     import os
     from libero.libero.envs import OffScreenRenderEnv  # type: ignore
-    from libero.libero.utils.libero_utils import get_libero_path  # type: ignore
+    from libero.libero import get_libero_path  # type: ignore
 
     task = task_suite.get_task(task_idx)
     instruction = task.language
