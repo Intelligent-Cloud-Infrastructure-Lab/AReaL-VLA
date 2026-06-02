@@ -202,15 +202,26 @@ def run_episode(
     trial_id indexes into task_suite.get_task_init_states(task_idx) —
     a fixed array of pre-generated initial states, not a random seed.
     """
+    import os
     from libero.libero.envs import OffScreenRenderEnv  # type: ignore
+    from libero.libero.utils.libero_utils import get_libero_path  # type: ignore
 
     task = task_suite.get_task(task_idx)
     instruction = task.language
     initial_states = task_suite.get_task_init_states(task_idx)
     initial_state = initial_states[trial_id]
 
+    # Build the full bddl file path — task.bddl_file is just the filename,
+    # get_libero_path("bddl_files") gives the directory within the package.
+    # Matches LIBERO README and SimpleVLA-RL's get_libero_env() helper.
+    task_bddl_file = os.path.join(
+        get_libero_path("bddl_files"),
+        task.problem_folder,
+        task.bddl_file,
+    )
+
     env = OffScreenRenderEnv(
-        bddl_file_name=task.bddl_file,
+        bddl_file_name=task_bddl_file,
         camera_heights=256,
         camera_widths=256,
     )
@@ -225,15 +236,17 @@ def run_episode(
     max_steps = LIBERO_MAX_STEPS.get(config.benchmark, 512)
     step = 0
     success = False
+    done = False
 
-    while step < max_steps and not success:
-        # Get current image observation
+    while step < max_steps and not success and not done:
+        # Get image — LIBERO obs dict key is "agentview_image".
+        # Flip [::-1, ::-1] to match SimpleVLA-RL rob_rollout.py line 370:
+        #   img = obs["agentview_image"][::-1, ::-1]
         image = obs.get("agentview_image")
         if image is None:
-            try:
-                image = env.render(mode="rgb_array")
-            except Exception:
-                break
+            logger.warning("agentview_image not in obs — episode aborted")
+            break
+        image = np.ascontiguousarray(image[::-1, ::-1])
 
         # Generate action chunk
         actions = generate_actions(model, processor, image, instruction, config)
@@ -250,8 +263,6 @@ def run_episode(
                 break
             if done:
                 break
-        if done and not success:
-            break
 
     env.close()
     return success
@@ -265,8 +276,15 @@ def run_episode(
 def run_eval(config: EvalConfig) -> dict:
     try:
         from libero.libero import benchmark as libero_benchmark  # type: ignore
-    except ImportError:
-        raise ImportError("Install LIBERO: pip install libero-benchmark")
+    except ImportError as exc:
+        raise ImportError(
+            f"LIBERO import failed: {exc}\n\n"
+            "Install LIBERO and its dependencies:\n"
+            "    cd LIBERO\n"
+            "    pip install -r requirements.txt\n"
+            "    pip install -e .\n"
+            "(Make sure you are in the simplevla conda env)"
+        ) from exc
 
     benchmark_dict = libero_benchmark.get_benchmark_dict()
     if config.benchmark not in benchmark_dict:
