@@ -1,173 +1,344 @@
 # AReaL-VLA: LIBERO GRPO Configuration
-# Based on examples/math/gsm8k_grpo.yaml — same structure, VLA fields added.
-#
-# Usage:
-#   python examples/robot/libero_rl.py \
-#       examples/robot/conf/libero_grpo.yaml \
-#       actor.path=Haozhan72/Openvla-oft-SFT-libero-spatial-traj1
+# Built from GRPOConfig defaults — every ??? field is filled in.
 
 experiment_name: libero-vla-grpo
 trial_name: trial-0
 
 seed: 42
 enable_offload: false
-total_train_epochs: 100      # matches shell script trainer.total_epochs=100
+total_train_epochs: 100
+total_train_steps: null
+total_train_n_seqs: null
 tokenizer_path: ${actor.path}
+allocation_mode: ''
+dynamic_bs: false
 
-# ── VLA-specific fields ──────────────────────────────────────────────────────
-# These are read by VLARobotWorkflow and libero_rl.py
-benchmark: libero_spatial               # libero_spatial | libero_object | libero_goal | libero_10
+# ── VLA-specific fields (read by VLARobotWorkflow + libero_rl.py) ────────────
+benchmark: libero_spatial
 n_seeds_per_task: 5
 val_fraction: 0.1
 inference_server_address: "tcp://localhost:5556"
-action_chunks_len: 8                    # shell script: action_chunks_len=8
-max_episode_steps: 512                  # rob_rollout.py LIBERO max_steps
-unnorm_key: "libero_spatial_no_noops"  # after running the patch script
+action_chunks_len: 8
+max_episode_steps: 512
+unnorm_key: "libero_spatial_no_noops"
 
 # ── Cluster ──────────────────────────────────────────────────────────────────
 cluster:
-  n_nodes: 1
-  n_gpus_per_node: 8
-  fileroot: /tmp/areal_vla
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
+    etcd3_addr: localhost:2379
+    ray_actor_name: ray_kv_store
+  cluster_name: local
+  fileroot: /tmp/areal_vla
+  n_nodes: 1
+  n_gpus_per_node: 8
 
 scheduler:
   type: null
+  endpoint: http://localhost:8081
+  deploy_mode: separation
+  functioncall_service_domain: http://localhost:8080
+  reward_functioncall_config: {}
+  reward_model_path: ''
+  reward_model_service_url: http://localhost:30000/classify
+
+# ── Generation config ─────────────────────────────────────────────────────────
+gconfig:
+  n_samples: 8
+  max_new_tokens: 56          # action_chunks_len(8) * action_token_len(7)
+  min_new_tokens: 0
+  max_tokens: 512
+  greedy: false
+  top_p: 1.0
+  top_k: 100000000
+  temperature: 1.6            # shell script: rollout.temperature=1.6
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  lora_name: default_lora
+  use_beam_search: false
+
+eval_gconfig: null
 
 # ── Rollout ──────────────────────────────────────────────────────────────────
-# VLARobotWorkflow handles its own rollout via ZMQ — these fields satisfy
-# AReaL's config validation but the backend is effectively bypassed.
 rollout:
-  backend: "sglang:d4p1t1"
+  backend: "sglang:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
   max_concurrent_rollouts: 32
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 0
   enable_rollout_tracing: false
-  scheduling_spec: ${actor.scheduling_spec}
-  fileroot: ${cluster.fileroot}
+  check_trajectory_format: false
   tokenizer_path: ${tokenizer_path}
   dump_to_file: false
+  setup_timeout: 300.0
+  request_timeout: 3600.0
+  request_retries: 3
+  pause_grace_period: 0.0
+  scheduling_spec:
+    - cpu: 8
+      gpu: 0
+      mem: 32
+      port_count: 2
+      image: /storage/openpsi/images/areal-latest.sif
+      task_type: worker
+      env_vars: {}
+      cmd: python -m areal.infra.rpc.rpc_server
+      srun_additional_args: --unbuffered --mpi=pmi2 -K --chdir $PWD
+      additional_bash_cmds: null
+      container_type: apptainer
+      mount: /storage:/storage
+      nodelist: null
+      exclude: null
+      ray_placement_strategy: shared
+  scheduling_strategy:
+    type: separation
+    target: null
+    fork: true
+  use_lora: false
   agent:
     mode: inline
     export_style: individual
     turn_discount: 1.0
+  return_routed_experts: false
+  _version: v1
+  model: default
+  routing_strategy: round_robin
+  poll_interval: 5.0
+  admin_api_key: areal-admin-key
+  api_url: null
+  provider_api_key: null
 
-# ── Generation config ─────────────────────────────────────────────────────────
-gconfig:
-  n_samples: 8              # GRPO group size — matches data.n_samples=8 in shell script
-  min_new_tokens: 0
-  max_new_tokens: 56        # action_chunks_len(8) * action_token_len(7) = 56
-  max_tokens: 512
-  greedy: false
-  temperature: 1.6          # shell script: rollout.temperature=1.6
-
-# ── Actor (training engine) ───────────────────────────────────────────────────
+# ── Actor ─────────────────────────────────────────────────────────────────────
 actor:
-  backend: "fsdp:d8p1t1"   # 8-way data parallel, 1 pipeline, 1 tensor parallel
+  backend: "fsdp:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Haozhan72/Openvla-oft-SFT-libero-spatial-traj1
+  attn_impl: flash_attention_2
+  use_kernels: false
   init_from_scratch: false
-  disable_dropout: true
-  gradient_checkpointing: false   # shell script: enable_gradient_checkpointing=False
-  dtype: bfloat16
+  is_critic: false
+  temperature: ${gconfig.temperature}
   mb_spec:
-    max_tokens_per_mb: 4096       # smaller — VLA sequences are long
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 4096
+    n_mbs_divisor: 1
     packing_algorithm: ffd
+  pad_to_maximum: false
+  disable_dropout: true
+  gradient_checkpointing: false
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  optimizer_dtype: float32
   optimizer:
     type: adam
-    lr: 5.0e-6                    # shell script: actor.optim.lr=5e-6
+    lr: 5.0e-6
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
     eps: 1e-8
     lr_scheduler_type: constant
-    gradient_clipping: 1.0        # shell script: actor.grad_clip=1
+    gradient_clipping: 1.0
     warmup_steps_proportion: 0.0
-  eps_clip: 0.28                  # shell script: actor.clip_ratio_high=0.28
-  temperature: ${gconfig.temperature}
-  reward_scaling: 1.0
-  reward_bias: 0.0
-  kl_ctl: 0.0                     # shell script: algorithm.kl_ctrl.kl_coef=0.00
+  weight_update_mode: xccl
+  fsdp:
+    wrap_policy: null
+    offload_params: false
+    memory_efficient_load: false
+    per_layer_optim_step: false
+    optim_step_prefetch_layers: 1
+    shard_vision_across_sp: false
+  offload: false
+  use_lora: false
+  lora_rank: 32
+  lora_alpha: 16
+  target_modules: []
+  peft_type: lora
+  enable_tree_training: false
+  scheduling_spec:
+    - cpu: 8
+      gpu: 0
+      mem: 32
+      port_count: 2
+      image: /storage/openpsi/images/areal-latest.sif
+      task_type: worker
+      env_vars: {}
+      cmd: python -m areal.infra.rpc.rpc_server
+      srun_additional_args: --unbuffered --mpi=pmi2 -K --chdir $PWD
+      additional_bash_cmds: null
+      container_type: apptainer
+      mount: /storage:/storage
+      nodelist: null
+      exclude: null
+      ray_placement_strategy: shared
+  scheduling_strategy:
+    type: separation
+    target: null
+    fork: true
+  _version: v1
+  admin_api_key: areal-admin-key
+  log_level: warning
+  request_timeout: 3600.0
+  setup_timeout: 3600.0
   ppo_n_minibatches: 1
-  recompute_logprob: true
-  use_decoupled_loss: true
+  eps_clip: 0.28
+  eps_clip_higher: null
+  c_clip: null
+  m2_threshold: null
   reward_norm:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 20.0
+  overlong_reward_penalty: false
+  overlong_tokens: null
+  overlong_penalty_factor: null
+  mask_no_eos_with_zero: false
+  discount: 1.0
+  gae_lambda: 1.0
   adv_norm:
     mean_level: batch
     std_level: batch
-  weight_update_mode: xccl
+  kl_ctl: 0.0
+  kl_estimator: k1
+  use_sapo_loss: false
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling: null
+  importance_sampling_level: token
+  prox_logp_method: recompute
+  log_agent_stats: false
+  log_agent_stats_keys: []
   max_new_tokens: ${gconfig.max_new_tokens}
-  scheduling_spec:
-    - task_type: worker
-      port_count: 2
-      gpu: 1
-      mem: 32
-      cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
 
-# ── Reference model ───────────────────────────────────────────────────────────
-ref:
-  backend: ${actor.backend}
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: ${actor.path}
-  init_from_scratch: false
-  disable_dropout: true
-  dtype: ${actor.dtype}
-  mb_spec:
-    max_tokens_per_mb: 4096
-    packing_algorithm: ffd
-  optimizer: null
-  scheduling_strategy:
-    type: colocation
-    target: actor
-  scheduling_spec: ${actor.scheduling_spec}
+ref: null
+critic: null
+teacher: null
 
-# ── SGLang / vLLM (required by config schema even though we use ZMQ) ─────────
+# ── SGLang / vLLM ─────────────────────────────────────────────────────────────
 sglang:
   model_path: ${actor.path}
   random_seed: ${seed}
-  skip_tokenizer_init: true
-  dtype: ${actor.dtype}
-  max_running_requests: null
+  skip_tokenizer_init: false
+  disable_cuda_graph: false
+  disable_radix_cache: true
+  disable_cuda_graph_padding: false
+  enable_nccl_nvls: false
+  disable_outlines_disk_cache: false
+  disable_custom_all_reduce: false
+  disable_overlap_schedule: false
+  enable_mixed_chunk: false
+  enable_dp_attention: false
+  enable_ep_moe: false
+  enable_torch_compile: false
+  torch_compile_max_bs: 32
+  cuda_graph_max_bs: null
+  cuda_graph_bs: null
+  torchao_config: ''
+  enable_nan_detection: false
+  enable_p2p_check: false
+  triton_attention_reduce_in_fp32: false
+  triton_attention_num_kv_splits: 8
+  num_continuous_decode_steps: 1
+  enable_memory_saver: false
+  allow_auto_truncate: false
+  attention_backend: fa3
+  enable_multimodal: false
+  sampling_backend: null
   context_length: 4096
   mem_fraction_static: 0.8
+  max_running_requests: null
+  chunked_prefill_size: -1
+  max_prefill_tokens: 32768
+  schedule_policy: lpm
+  schedule_conservativeness: 1.0
+  cpu_offload_gb: 0
+  dtype: bfloat16
+  kv_cache_dtype: auto
+  dp_size: 1
+  ep_size: 1
+  enable_lora: null
+  max_lora_rank: null
+  max_loaded_loras: 8
+  lora_paths: null
+  lora_backend: triton
+  log_level: warning
+  log_level_http: warning
+  log_requests: false
+  log_requests_level: 0
+  show_time_cost: false
+  enable_metrics: true
+  decode_log_interval: 1
+  enable_multithread_load: false
+  enable_return_routed_experts: false
 
 vllm:
   model: ${actor.path}
   seed: ${seed}
   skip_tokenizer_init: false
-  dtype: ${actor.dtype}
+  enforce_eager: false
+  dtype: bfloat16
+  distributed_executor_backend: mp
+  max_num_seqs: 256
+  block_size: 16
+  cpu_offload_gb: 0.0
+  disable_sliding_window: true
   max_model_len: 4096
+  no_enable_chunked_prefill: false
+  no_enable_prefix_caching: true
   gpu_memory_utilization: 0.8
+  worker_extension_cls: areal.engine.vllm_ext.vllm_worker_extension.VLLMWorkerExtension
+  enable_sleep_mode: false
+  uvicorn_log_level: warning
+  enable_lora: false
+  max_lora_rank: 16
+  max_loras: 8
+  lora_modules: null
 
 # ── Datasets ──────────────────────────────────────────────────────────────────
-# RobotTaskDataset is instantiated in libero_rl.py — these fields tell
-# PPOTrainer batch sizes and are also used for config validation.
 train_dataset:
-  batch_size: 8             # = gconfig.n_samples (one group per step)
+  split: train
+  path: robot         # placeholder — RobotTaskDataset used instead in libero_rl.py
+  type: rl
+  batch_size: 8
   shuffle: true
   pin_memory: false
   num_workers: 0
-  path: null                # not used — RobotTaskDataset built in libero_rl.py
-  type: rl
-  max_length: 512
+  num_dataset_workers: 1
+  drop_last: true
+  max_length: null
+  dataset_kwargs: {}
+  scheduling_spec:
+    cpu: 1
+    gpu: 0
+    mem: 10
+    port_count: 2
+    image: /storage/openpsi/images/areal-latest.sif
+    task_type: worker
+    env_vars: {}
+    cmd: python3 -m areal.infra.rpc.guard
+    srun_additional_args: --unbuffered --mpi=pmi2 -K --chdir $PWD
+    additional_bash_cmds: null
+    container_type: apptainer
+    mount: /storage:/storage
+    nodelist: null
+    exclude: null
+    ray_placement_strategy: shared
+  setup_timeout: 120.0
 
-valid_dataset:
-  batch_size: 8
-  pin_memory: false
-  num_workers: 0
-  path: null
-  type: rl
+valid_dataset: null
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 saver:
@@ -177,35 +348,60 @@ saver:
   freq_epochs: 1
   freq_steps: null
   freq_secs: null
+  mode: auto
 
 recover:
-  mode: disabled
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  fileroot: ${cluster.fileroot}
-  freq_epochs: 1
-  freq_steps: null
-  freq_secs: 3600
-
-evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
   freq_steps: null
   freq_secs: null
+  mode: disabled
+  retries: 3
+  no_save_optim: false
+  no_load_optim: false
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+  eval_before_train: false
 
 stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   wandb:
-    mode: disabled          # set to "online" and add api_key to enable
+    mode: disabled
+    wandb_base_url: ''
+    wandb_api_key: ''
+    entity: null
+    project: null
+    name: null
+    job_type: null
+    group: null
+    notes: null
+    tags: null
+    config: null
+    id_suffix: train
+  swanlab:
+    project: null
+    name: null
+    config: null
+    logdir: null
+    mode: disabled
+    api_key: null
+  tensorboard:
+    path: null
+  trackio:
+    mode: disabled
+    project: null
+    name: null
+    space_id: null
 
-perf_tracer:
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  fileroot: ${cluster.fileroot}
-  enabled: false
-  session_tracer:
-    enabled: false
+perf_tracer: null
+memory_profiler: null
