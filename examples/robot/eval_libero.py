@@ -88,6 +88,10 @@ class EvalConfig:
     action_token_len: int = ACTION_TOKEN_LEN
     num_steps_wait: int = NUM_STEPS_WAIT
     center_crop: bool = True
+    # unnorm_key: passed to generate_action_verl() for action unnormalisation.
+    # The Haozhan72 checkpoints need "libero_spatial_no_noops" (injected via the
+    # patch script).  Leave empty to use the benchmark name as the key.
+    unnorm_key: str = ""
     device: str = "cuda:0"
     output_path: str | None = None
     tasks: list[str] | None = None  # e.g. ["libero_spatial/0", "libero_spatial/3"]
@@ -162,6 +166,9 @@ def generate_actions(
     attn_mask    = inputs["attention_mask"].to(config.device)
     pixel_values = inputs["pixel_values"].to(config.device, dtype=torch.bfloat16)
 
+    # Use explicit unnorm_key if provided, otherwise fall back to benchmark name
+    unnorm_key = config.unnorm_key if config.unnorm_key else config.benchmark
+
     with torch.no_grad():
         actions, _ = model.generate_action_verl(
             input_ids=input_ids,
@@ -169,7 +176,7 @@ def generate_actions(
             attention_mask=attn_mask,
             padding_idx=processor.tokenizer.pad_token_id,
             do_sample=DO_SAMPLE,
-            unnorm_key=config.benchmark,
+            unnorm_key=unnorm_key,
             temperature=1.0,
         )
 
@@ -413,6 +420,10 @@ def main() -> None:
     p.add_argument("--benchmark", default="libero_spatial",
                    choices=list(LIBERO_MAX_STEPS.keys()))
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--unnorm_key", default="",
+                   help="Action unnormalisation key. For Haozhan72 checkpoints use "
+                        "'libero_spatial_no_noops' after running the patch script. "
+                        "Defaults to the benchmark name if not set.")
     p.add_argument("--no_center_crop", action="store_true")
     p.add_argument("--output_path", default=None,
                    help="Save JSON results to this path")
@@ -424,6 +435,7 @@ def main() -> None:
         model_path=args.model_path,
         benchmark=args.benchmark,
         device=args.device,
+        unnorm_key=args.unnorm_key,
         center_crop=not args.no_center_crop,
         output_path=args.output_path,
         tasks=args.tasks,
