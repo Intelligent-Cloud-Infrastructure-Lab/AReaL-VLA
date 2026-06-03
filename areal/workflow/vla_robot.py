@@ -212,285 +212,230 @@ class VLARobotWorkflow(RolloutWorkflow):
     """
     AReaL RolloutWorkflow for VLA robot training.
 
-    One call to arun_episode() corresponds to one full robot episode:
-      - environment initialised from the task spec in `data`
-      - image rendered at each step, passed to the inference engine
-      - action tokens decoded to continuous robot action and stepped
-      - binary 0/1 reward aligned to token positions
-      - post-success tokens masked from the loss
+    PPOTrainer instantiates this class with workflow_kwargs as **kwargs,
+    then calls arun_episode(engine, data) for each training sample.
 
-    Parameters
-    ----------
-    env_factory:
-        Callable(task_name, seed) → gym-like environment.  The environment must
-        expose reset(), render(mode='rgb_array'), step(action), and return an
-        `info` dict with a boolean "success" key.
-    action_decoder:
-        Callable(token_ids: list[int]) → np.ndarray of shape (action_dim,).
-        Converts the VLA model's discrete action token IDs back to continuous
-        joint angles / end-effector deltas.
-    instruction_tokenizer:
-        Callable(instruction_str: str) → list[int].  Converts the task's natural
-        language instruction into token IDs for the VLA prompt.
-    image_tokenizer:
-        Optional callable(np.ndarray image) → list[int].  If the VLA model
-        encodes images as discrete token IDs, supply this.  If None, raw numpy
-        images are passed directly in VLAStepRequest.image.
-    gconfig:
-        AReaL GenerationHyperparameters (temperature, top-p, …).  Only
-        `max_new_tokens` is forwarded to the VLA engine per step.
-    action_chunk_len:
-        Number of action tokens generated per environment step.  Must match
-        the VLA model's action tokenisation.  Default 7 (OpenVLA-OFT / LIBERO).
-    max_episode_steps:
-        Maximum number of environment steps before the episode is cut off.
-    rollout_stat_scope:
-        Name prefix for AReaL's stats_tracker metrics.
-    dump_dir:
-        If set, saves episode summaries (reward, steps, success) as JSON files
-        for debugging.  Mirrors SimpleVLA-RL's video-saving logic.
+    The InferenceEngine passed by AReaL is IGNORED — we use our own
+    VLAInferenceClient (ZMQ) to talk to vla_inference_server.py running
+    in the simplevla conda environment.
+
+    Parameters (passed as workflow_kwargs from libero_rl.py)
+    ---------------------------------------------------------
+    server_address : ZMQ address of the inference server
+    benchmark      : LIBERO benchmark name (used as unnorm_key fallback)
+    action_chunks_len : env steps per VLA generation call (default 8)
+    max_episode_steps : max LIBERO steps per episode (default 512)
+    unnorm_key     : action unnormalisation key for generate_action_verl
     """
 
-    def __init__(
-        self,
-        env_factory: Callable[[str, int], Any],
-        action_decoder: Callable[[list[int]], np.ndarray],
-        instruction_tokenizer: Callable[[str], list[int]],
-        gconfig: Any,  # areal.api.cli_args.GenerationHyperparameters
-        image_tokenizer: Callable[[np.ndarray], list[int]] | None = None,
-        action_chunk_len: int = 7,
-        max_episode_steps: int = 300,
-        rollout_stat_scope: str = "robot-rollout",
-        dump_dir: str | None = None,
-    ) -> None:
-        self.env_factory = env_factory
-        self.action_decoder = action_decoder
-        self.instruction_tokenizer = instruction_tokenizer
-        self.image_tokenizer = image_tokenizer
-        self.gconfig = gconfig
-        self.action_chunk_len = action_chunk_len
-        self.max_episode_steps = max_episode_steps
-        self.rollout_stat_scope = rollout_stat_scope
-        self.dump_dir = dump_dir
+    def __init__(self, **kwargs):
+        self.server_address   = kwargs.get("server_address", "tcp://localhost:5556")
+        self.benchmark        = kwargs.get("benchmark", "libero_spatial")
+        self.action_chunks_len = kwargs.get("action_chunks_len", 8)
+        self.max_episode_steps = kwargs.get("max_episode_steps", 512)
+        self.unnorm_key       = kwargs.get("unnorm_key", "libero_spatial_no_noops")
+        self.dump_dir         = kwargs.get("dump_dir", None)
+        self.rollout_stat_scope = kwargs.get("rollout_stat_scope", "robot-rollout")
 
-        if dump_dir is not None:
-            os.makedirs(dump_dir, exist_ok=True)
+        # ZMQ client — connected lazily on first arun_episode call
+        self._client = None
+        self._client_lock = None  # asyncio.Lock, created on first use
+
+        if self.dump_dir is not None:
+            os.makedirs(self.dump_dir, exist_ok=True)
 
         logger.info(
-            f"VLARobotWorkflow initialised: action_chunk_len={action_chunk_len}, "
-            f"max_episode_steps={max_episode_steps}"
+            f"VLARobotWorkflow: server={self.server_address}  "
+            f"benchmark={self.benchmark}  "
+            f"action_chunks_len={self.action_chunks_len}  "
+            f"max_episode_steps={self.max_episode_steps}"
         )
 
-    # ------------------------------------------------------------------
-    # RolloutWorkflow entry point
-    # ------------------------------------------------------------------
+    async def _get_client(self):
+        """Lazy-connect the ZMQ client (safe for concurrent coroutines)."""
+        if self._client_lock is None:
+            self._client_lock = asyncio.Lock()
+        async with self._client_lock:
+            if self._client is None:
+                from areal.engine.vla_inference_client import VLAInferenceClient
+                self._client = VLAInferenceClient(
+                    server_address=self.server_address,
+                    ping_timeout=60.0,
+                    request_timeout=600.0,
+                )
+                await self._client.connect()
+        return self._client
+
+    def _make_env(self, task_key: str, trial_id: int):
+        """
+        Create and reset a LIBERO environment.
+        task_key format: "libero_spatial/3"  (benchmark/task_idx)
+        trial_id: index into task_suite.get_task_init_states(task_idx)
+        """
+        import numpy as np
+        from libero.libero import benchmark as libero_benchmark  # type: ignore
+        from libero.libero import get_libero_path               # type: ignore
+        from libero.libero.envs import OffScreenRenderEnv        # type: ignore
+
+        suite_name, task_id_str = task_key.rsplit("/", 1)
+        task_id = int(task_id_str)
+
+        bm = libero_benchmark.get_benchmark_dict()[suite_name]()
+        task = bm.get_task(task_id)
+        initial_states = bm.get_task_init_states(task_id)
+        initial_state = initial_states[trial_id]
+
+        import os as _os
+        task_bddl_file = _os.path.join(
+            get_libero_path("bddl_files"),
+            task.problem_folder,
+            task.bddl_file,
+        )
+        env = OffScreenRenderEnv(
+            bddl_file_name=task_bddl_file,
+            camera_heights=256,
+            camera_widths=256,
+        )
+        env.reset()
+        obs = env.set_init_state(initial_state)
+
+        # Physics settle (num_steps_wait=10 from shell script)
+        dummy = np.zeros(7, dtype=np.float32)
+        for _ in range(10):
+            obs, _, _, _ = env.step(dummy)
+
+        return env, obs, task.language
 
     async def arun_episode(
         self,
-        engine: VLAEngine,
+        engine: Any,   # AReaL InferenceEngine — ignored, we use ZMQ client
         data: dict[str, Any],
     ) -> dict[str, torch.Tensor] | None:
         """
-        Execute one full robot episode and return an AReaL-format trajectory.
-
-        This is the single method that AReaL's WorkflowExecutor calls
-        (via AsyncTaskRunner) for every item that comes off the dataloader.
+        Run one full LIBERO episode and return an AReaL-format trajectory.
 
         Parameters
         ----------
-        engine:
-            The VLA inference engine.  Must implement VLAEngine (or AReaL's
-            InferenceEngine + the VLA-specific fields).
-        data:
-            A single row from RobotTaskDataset:
-                task_name   : str
-                instruction : str
-                benchmark   : str
-                seed        : int
-
-        Returns
-        -------
-        AReaL trajectory dict with keys:
-            input_ids, loss_mask, logprobs, versions, attention_mask, rewards.
-        Each tensor has shape [1, seq_len] (leading batch dim = 1).
-        Returns None if the episode setup fails (skipped by WorkflowExecutor).
+        engine : AReaL InferenceEngine (ignored — we use VLAInferenceClient via ZMQ)
+        data   : dict from RobotTaskDataset:
+                   task_name   : "libero_spatial/3"  (suite/task_idx)
+                   instruction : str
+                   benchmark   : str
+                   seed        : int (trial_id into initial_states[])
         """
-        task_name = data["task_name"]
+        task_key    = data["task_name"]
         instruction = data["instruction"]
-        seed = int(data.get("seed", 0))
-        version = engine.get_version()
+        trial_id    = int(data.get("seed", 0))
 
-        # ------------------------------------------------------------------
-        # 1. Tokenise instruction (once per episode — same prefix every step)
-        # ------------------------------------------------------------------
-        instruction_ids: list[int] = self.instruction_tokenizer(instruction)
-
-        # ------------------------------------------------------------------
-        # 2. Initialise environment
-        # ------------------------------------------------------------------
-        loop = asyncio.get_event_loop()
+        # 1. Get ZMQ client (lazy connect on first call)
         try:
-            env = await loop.run_in_executor(
-                None, self.env_factory, task_name, seed
-            )
-            await loop.run_in_executor(None, env.reset)
+            client = await self._get_client()
         except Exception as exc:
-            logger.warning(f"[VLARobotWorkflow] env init failed for {task_name}: {exc}")
+            logger.warning(f"[VLARobotWorkflow] ZMQ client connect failed: {exc}")
             return None
 
-        # ------------------------------------------------------------------
-        # 3. Episode rollout loop
-        # ------------------------------------------------------------------
+        # 2. Create LIBERO environment
+        loop = asyncio.get_event_loop()
+        try:
+            env, obs, instr = await loop.run_in_executor(
+                None, self._make_env, task_key, trial_id
+            )
+            instruction = instr  # use task's own language instruction
+        except Exception as exc:
+            logger.warning(f"[VLARobotWorkflow] env init failed {task_key}: {exc}")
+            return None
+
+        # 3. Episode loop
         buf = _EpisodeBuffer()
         success = False
-        finish_step: int = self.max_episode_steps  # pessimistic default
-        episode_steps: int = 0
+        finish_step = self.max_episode_steps
+        episode_steps = 0
         t_start = time.monotonic()
+        done = False
 
-        for step_idx in range(self.max_episode_steps):
-            # 3a. Render current observation --------------------------------
+        while episode_steps < self.max_episode_steps and not done:
+            # Render image
             try:
-                image: np.ndarray = await loop.run_in_executor(
-                    None, lambda: env.render(mode="rgb_array")
-                )
-            except Exception as exc:
-                logger.warning(f"[VLARobotWorkflow] render failed at step {step_idx}: {exc}")
-                break
-
-            # 3b. Build VLA request ----------------------------------------
-            image_token_ids: list[int] | None = None
-            if self.image_tokenizer is not None:
-                image_token_ids = await loop.run_in_executor(
-                    None, self.image_tokenizer, image
-                )
-
-            req = VLAStepRequest(
-                instruction_ids=instruction_ids,
-                image=image,
-                image_token_ids=image_token_ids,
-                max_new_tokens=self.action_chunk_len,
-                instruction_text=instruction,  # for VLAInferenceServer
-            )
-
-            # 3c. Generate action tokens (async, does not block training) ---
-            try:
-                resp: VLAStepResponse = await engine.agenerate(req)
-            except Exception as exc:
-                logger.warning(f"[VLARobotWorkflow] engine.agenerate failed: {exc}")
-                break
-
-            # 3d. Decode action tokens → continuous action -----------------
-            # VLAInferenceServer pre-decodes actions using model norm_stats in
-            # the SimpleVLA env and returns decoded_action directly.
-            # VLALocalEngine (same-env) leaves decoded_action=None, so we fall
-            # back to the local action_decoder.
-            try:
-                if resp.decoded_action is not None:
-                    action: np.ndarray = resp.decoded_action
-                else:
-                    action = await loop.run_in_executor(
-                        None, self.action_decoder, resp.output_tokens
+                image = obs.get("agentview_image")
+                if image is None:
+                    image = await loop.run_in_executor(
+                        None, lambda: env.render(mode="rgb_array")
                     )
+                image = np.ascontiguousarray(image[::-1, ::-1])
             except Exception as exc:
-                logger.warning(f"[VLARobotWorkflow] action decode failed: {exc}")
+                logger.warning(f"[VLARobotWorkflow] render failed: {exc}")
                 break
 
-            # 3e. Step environment -----------------------------------------
+            # Request action chunk from ZMQ server
+            req = VLAStepRequest(
+                instruction_ids=[],
+                image=image,
+                max_new_tokens=self.action_chunks_len,
+                instruction_text=instruction,
+            )
             try:
-                step_result = await loop.run_in_executor(
-                    None, env.step, action
-                )
-                # Support both (obs, rew, done, info) and (obs, rew, term, trunc, info)
-                if len(step_result) == 5:
-                    obs, _rew, terminated, truncated, info = step_result
-                    done = terminated or truncated
-                else:
-                    obs, _rew, done, info = step_result
+                resp: VLAStepResponse = await client.agenerate(req)
+            except Exception as exc:
+                logger.warning(f"[VLARobotWorkflow] agenerate failed: {exc}")
+                break
+
+            action = resp.decoded_action  # continuous action, pre-decoded by server
+            if action is None:
+                logger.warning("[VLARobotWorkflow] decoded_action is None — skipping")
+                break
+
+            # Step action_chunks_len environment steps
+            step_success = False
+            try:
+                for chunk_step in range(self.action_chunks_len):
+                    if episode_steps >= self.max_episode_steps:
+                        done = True
+                        break
+                    a = action[min(chunk_step, len(action) - 1)]
+                    obs, _, done, info = await loop.run_in_executor(None, env.step, a)
+                    episode_steps += 1
+                    if info.get("success", False):
+                        step_success = True
+                        break
+                    if done:
+                        break
             except Exception as exc:
                 logger.warning(f"[VLARobotWorkflow] env.step failed: {exc}")
                 break
 
-            episode_steps = step_idx + 1
-
-            # 3f. Detect task success ---------------------------------------
-            #
-            # The info dict from LIBERO/RoboTwin contains a boolean "success"
-            # flag.  We record the first step at which success is detected.
-            step_succeeded = bool(info.get("success", False))
-            if step_succeeded and not success:
+            if step_success and not success:
                 success = True
-                finish_step = episode_steps   # 1-indexed: steps 1..finish_step are valid
+                finish_step = episode_steps
 
-            # 3g. Determine whether this step's action tokens are post-success
-            #
-            # Once we record success=True, all subsequent steps' tokens are
-            # masked out.  The current step (where success==True for the first
-            # time) is STILL included in the loss — it's the pivot step.
-            step_is_post_success = success and (step_idx + 1) > finish_step
-
-            # 3h. Buffer this step's tokens --------------------------------
+            step_is_post_success = success and episode_steps > finish_step
             buf.append_step(resp, step_is_post_success=step_is_post_success)
 
-            if done:
-                break
-
-        # ------------------------------------------------------------------
-        # 4. Cleanup environment
-        # ------------------------------------------------------------------
+        # 4. Cleanup
         try:
             await loop.run_in_executor(None, env.close)
         except Exception:
             pass
 
         elapsed = time.monotonic() - t_start
-
-        # ------------------------------------------------------------------
-        # 5. Compute binary reward
-        #
-        # SimpleVLA-RL uses outcome-level 0/1 rewards.  No shaping needed.
-        # ------------------------------------------------------------------
         binary_reward = 1.0 if success else 0.0
 
-        # ------------------------------------------------------------------
-        # 6. Emit stats for AReaL's stats_tracker / wandb
-        # ------------------------------------------------------------------
         self._emit_stats(
-            reward=binary_reward,
-            success=success,
-            episode_steps=episode_steps,
-            finish_step=finish_step,
-            elapsed=elapsed,
-            task_name=task_name,
+            reward=binary_reward, success=success,
+            episode_steps=episode_steps, finish_step=finish_step,
+            elapsed=elapsed, task_name=task_key,
         )
 
-        # ------------------------------------------------------------------
-        # 7. Handle degenerate episodes
-        #
-        # If we collected zero steps (immediate env failure), return None so
-        # WorkflowExecutor can skip this sample.
-        # ------------------------------------------------------------------
         if episode_steps == 0 or len(buf.input_ids) == 0:
-            logger.warning(
-                f"[VLARobotWorkflow] episode for {task_name} collected 0 steps — skipping"
-            )
+            logger.warning(f"[VLARobotWorkflow] 0 steps for {task_key} — skipping")
             return None
 
-        # ------------------------------------------------------------------
-        # 8. Assemble AReaL trajectory tensors
-        # ------------------------------------------------------------------
         trajectory = buf.build_tensors(reward=binary_reward)
 
-        # ------------------------------------------------------------------
-        # 9. Optional: dump episode summary for debugging
-        # ------------------------------------------------------------------
         if self.dump_dir is not None:
             self._dump_episode(
-                task_name=task_name,
-                seed=seed,
-                version=version,
-                success=success,
-                finish_step=finish_step,
-                episode_steps=episode_steps,
+                task_name=task_key, seed=trial_id,
+                version=client.get_version(), success=success,
+                finish_step=finish_step, episode_steps=episode_steps,
                 reward=binary_reward,
             )
 
