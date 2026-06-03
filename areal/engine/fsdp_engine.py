@@ -35,7 +35,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
     AutoModelForImageTextToText,
     AutoModelForTokenClassification,
     PretrainedConfig,
@@ -989,11 +988,7 @@ class FSDPEngine(TrainEngine):
             self.config.path,
             trust_remote_code=True,
             )
-        
-            if getattr(config, "model_type", None) == "openvla":
-                model_class = AutoModelForVision2Seq
-            else:
-                model_class = AutoModelForCausalLM
+            model_class = AutoModelForCausalLM
         
             model_kwargs = {}
 
