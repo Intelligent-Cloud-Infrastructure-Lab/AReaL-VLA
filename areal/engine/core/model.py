@@ -8,6 +8,7 @@ VALID_VISION_MODELS = [
     "qwen3_vl",
     "qwen3_vl_moe",
     "gemma3",
+    "openvla",
 ]
 # This registry is used to check if a model is a vision model that we have checked it works with AReaL.
 # As different vision models vary in their image processing, special tokens and keys, etc.
