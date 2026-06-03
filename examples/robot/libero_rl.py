@@ -18,6 +18,7 @@ Step 2 — start training (AReaL venv):
 """
 
 import sys
+from dataclasses import dataclass
 
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
@@ -29,8 +30,20 @@ from areal.dataset.robot_dataset import (
 )
 
 
+@dataclass
+class VLAGRPOConfig(GRPOConfig):
+    """GRPOConfig extended with VLA-specific fields defined in libero_grpo.yaml."""
+    benchmark: str = "libero_spatial"
+    n_seeds_per_task: int = 5
+    val_fraction: float = 0.1
+    inference_server_address: str = "tcp://localhost:5556"
+    action_chunks_len: int = 8
+    max_episode_steps: int = 512
+    unnorm_key: str = "libero_spatial_no_noops"
+
+
 def main(args):
-    config, _ = load_expr_config(args, GRPOConfig)
+    config, _ = load_expr_config(args, VLAGRPOConfig)
 
     # VLA-specific fields come from the YAML (accessed via getattr with defaults)
     benchmark      = getattr(config, "benchmark", "libero_spatial")
