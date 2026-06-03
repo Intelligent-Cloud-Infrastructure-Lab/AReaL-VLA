@@ -1,156 +1,211 @@
 # AReaL-VLA: LIBERO GRPO Configuration
-#
-# Equivalent to SimpleVLA-RL's run_openvla_oft_rl_libero.sh but adapted for
-# AReaL's GRPO algorithm and async training infrastructure.
+# Based on examples/math/gsm8k_grpo.yaml — same structure, VLA fields added.
 #
 # Usage:
 #   python examples/robot/libero_rl.py \
-#       --config examples/robot/conf/libero_grpo.yaml \
-#       model_path=/path/to/openvla_oft_sft \
-#       cluster.n_gpus_per_node=8
+#       examples/robot/conf/libero_grpo.yaml \
+#       actor.path=Haozhan72/Openvla-oft-SFT-libero-spatial-traj1
 
-# ============================================================
-# Experiment identity
-# ============================================================
 experiment_name: libero-vla-grpo
 trial_name: trial-0
 
-# ============================================================
-# Model
-# ============================================================
-model_path: openvla/openvla-7b-oft          # override with your checkpoint
-tokenizer_path: ${model_path}               # shared tokenizer
-
-# ============================================================
-# Benchmark / environment
-# ============================================================
-benchmark: libero_object                     # libero_object | libero_spatial | libero_goal | libero_long
-n_seeds_per_task: 5                          # environment seeds for diversity
-val_fraction: 0.1                            # fraction of tasks held out for eval
-
-# ============================================================
-# Episode / action parameters
-# ============================================================
-action_chunk_len: 7                          # OpenVLA-OFT: 7 action tokens per step
-action_dim: 7                               # 7-DOF robot arm (LIBERO default)
-max_episode_steps: 300                       # LIBERO maximum horizon
-
-# ============================================================
-# RL algorithm: GRPO
-#
-# GRPO with mixed-success groups is the AReaL equivalent of SimpleVLA-RL's
-# mixed-success PPO strategy.  Each "group" = group_size rollouts of the SAME
-# task; advantages are normalised within the group.
-# ============================================================
-group_size: 8                                # rollouts per task per batch
-total_train_steps: 5000                      # total gradient steps
 seed: 42
+enable_offload: false
+total_train_epochs: 100      # matches shell script trainer.total_epochs=100
+tokenizer_path: ${actor.path}
 
-# Generation
-temperature: 1.0                             # training rollout temperature
-eval_temperature: 0.0                        # greedy at eval
+# ── VLA-specific fields ──────────────────────────────────────────────────────
+# These are read by VLARobotWorkflow and libero_rl.py
+benchmark: libero_spatial               # libero_spatial | libero_object | libero_goal | libero_10
+n_seeds_per_task: 5
+val_fraction: 0.1
+inference_server_address: "tcp://localhost:5556"
+action_chunks_len: 8                    # shell script: action_chunks_len=8
+max_episode_steps: 512                  # rob_rollout.py LIBERO max_steps
+unnorm_key: "libero_spatial_no_noops"  # after running the patch script
 
-# Dynamic curriculum sampler (SimpleVLA-RL "dynamic sampling")
-use_curriculum_sampler: true
-curriculum_epsilon: 0.05
-curriculum_ema_alpha: 0.10
-
-# ============================================================
-# Actor (training engine)
-# ============================================================
-actor:
-  path: ${model_path}
-  backend: fsdp                              # FSDP2 data-parallel training
-
-  # PPO / GRPO algorithm params
-  kl_ctl: 0.01                              # KL penalty coefficient (set 0 to disable)
-  clip_eps: 0.2                             # PPO clip epsilon
-  entropy_bonus: 0.01                       # entropy regularisation
-  group_size: ${group_size}
-
-  # GRPO advantage normalisation
-  grpo_normalise_within_group: true
-  grpo_clip_ratio: 0.2
-
-  # Optimiser
-  lr: 2.0e-5
-  weight_decay: 0.01
-  warmup_steps: 50
-  gradient_clip: 1.0
-
-  # Memory / throughput
-  gradient_checkpointing: true
-  micro_batch_size: 1                        # per-GPU batch (VLA models are large)
-  recompute_logprob: true                    # recompute logprobs after weight update
-
-  # FSDP2 sharding
-  fsdp_config:
-    sharding_strategy: FULL_SHARD
-    cpu_offload: false
-    optimizer_offload: false
-
-# ============================================================
-# Rollout (inference engine)
-#
-# Default: VLALocalEngine (inline, no HTTP server).
-# Override with sglang backend once your VLA model is supported:
-#   rollout:
-#     backend: sglang:d8
-#     path: ${model_path}
-# ============================================================
-rollout:
-  backend: local                             # vla_local_engine
-  path: ${model_path}
-  max_head_offpolicyness: 0                  # synchronous (0 = on-policy)
-
-# ============================================================
-# Cluster / scheduler
-# ============================================================
+# ── Cluster ──────────────────────────────────────────────────────────────────
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /tmp/areal_vla_ckpts
+  fileroot: /tmp/areal_vla
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
 
 scheduler:
-  type: local                                # local | ray | slurm
+  type: null
 
-# Allocation mode: d8 = 8-way data parallel on 1 node
-allocation_mode: d8
+# ── Rollout ──────────────────────────────────────────────────────────────────
+# VLARobotWorkflow handles its own rollout via ZMQ — these fields satisfy
+# AReaL's config validation but the backend is effectively bypassed.
+rollout:
+  backend: "sglang:d4p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 32
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: false
+  agent:
+    mode: inline
+    export_style: individual
+    turn_discount: 1.0
 
-# ============================================================
-# Eval
-# ============================================================
-eval_every_n_steps: 50
+# ── Generation config ─────────────────────────────────────────────────────────
+gconfig:
+  n_samples: 8              # GRPO group size — matches data.n_samples=8 in shell script
+  min_new_tokens: 0
+  max_new_tokens: 56        # action_chunks_len(8) * action_token_len(7) = 56
+  max_tokens: 512
+  greedy: false
+  temperature: 1.6          # shell script: rollout.temperature=1.6
 
-# ============================================================
-# Checkpointing
-# ============================================================
+# ── Actor (training engine) ───────────────────────────────────────────────────
+actor:
+  backend: "fsdp:d8p1t1"   # 8-way data parallel, 1 pipeline, 1 tensor parallel
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Haozhan72/Openvla-oft-SFT-libero-spatial-traj1
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: false   # shell script: enable_gradient_checkpointing=False
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 4096       # smaller — VLA sequences are long
+    packing_algorithm: ffd
+  optimizer:
+    type: adam
+    lr: 5.0e-6                    # shell script: actor.optim.lr=5e-6
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0        # shell script: actor.grad_clip=1
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.28                  # shell script: actor.clip_ratio_high=0.28
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.0                     # shell script: algorithm.kl_ctrl.kl_coef=0.00
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference model ───────────────────────────────────────────────────────────
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 4096
+    packing_algorithm: ffd
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── SGLang / vLLM (required by config schema even though we use ZMQ) ─────────
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 4096
+  mem_fraction_static: 0.8
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 4096
+  gpu_memory_utilization: 0.8
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
+# RobotTaskDataset is instantiated in libero_rl.py — these fields tell
+# PPOTrainer batch sizes and are also used for config validation.
+train_dataset:
+  batch_size: 8             # = gconfig.n_samples (one group per step)
+  shuffle: true
+  pin_memory: false
+  num_workers: 0
+  path: null                # not used — RobotTaskDataset built in libero_rl.py
+  type: rl
+  max_length: 512
+
+valid_dataset:
+  batch_size: 8
+  pin_memory: false
+  num_workers: 0
+  path: null
+  type: rl
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 saver:
-  save_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/checkpoints
-  save_every_n_steps: 100
-  max_ckpts_to_keep: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
 
-# ============================================================
-# Logging (Weights & Biases)
-# ============================================================
-stats_logger:
-  backend: wandb                             # wandb | tensorboard | none
-  wandb:
-    project: areal-vla
-    name: ${experiment_name}-${trial_name}
-  log_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/logs
-
-# Optional: path for episode JSON dumps
-dump_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/episodes
-
-# ============================================================
-# Recovery
-# ============================================================
 recover:
-  recover_dir: ${saver.save_dir}
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
 
-# ============================================================
-# Evaluator
-# ============================================================
 evaluator:
-  eval_batches: 20                           # number of val batches per eval
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled          # set to "online" and add api_key to enable
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
