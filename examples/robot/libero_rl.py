@@ -22,24 +22,13 @@ from dataclasses import dataclass
 
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
+from areal.api.vla_config import VLAGRPOConfig  # importable module — not __main__
 
 from areal.dataset.robot_dataset import (
     RobotTaskDataset,
     build_task_specs_from_libero_env,
     split_train_val,
 )
-
-
-@dataclass
-class VLAGRPOConfig(GRPOConfig):
-    """GRPOConfig extended with VLA-specific fields defined in libero_grpo.yaml."""
-    benchmark: str = "libero_spatial"
-    n_seeds_per_task: int = 5
-    val_fraction: float = 0.1
-    inference_server_address: str = "tcp://localhost:5556"
-    action_chunks_len: int = 8
-    max_episode_steps: int = 512
-    unnorm_key: str = "libero_spatial_no_noops"
 
 
 def main(args):
