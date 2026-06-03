@@ -1,18 +1,10 @@
 """
-LIBERO VLA RL Training — AReaL entry point.
+LIBERO VLA RL Training.
 
-Mirrors examples/math/gsm8k_rl.py exactly, substituting:
-  - RobotTaskDataset   instead of get_custom_dataset
-  - VLARobotWorkflow   instead of MathAgent
+Mirrors examples/math/gsm8k_rl.py exactly — only the dataset
+and workflow differ.
 
-Two-environment setup
----------------------
-The VLA model runs in a SEPARATE PROCESS (simplevla env, PyTorch 2.2).
-AReaL trains here (AReaL venv, PyTorch 2.9 + FSDP2).
-They communicate over ZMQ — VLARobotWorkflow connects to the ZMQ server
-inside arun_episode() and ignores the InferenceEngine AReaL passes.
-
-Step 1 — start inference server (separate terminal, simplevla env):
+Step 1 — start inference server (simplevla env, separate terminal):
     bash examples/robot/start_inference_server.sh \
         --model_path Haozhan72/Openvla-oft-SFT-libero-spatial-traj1 \
         --benchmark libero_spatial \
@@ -22,13 +14,10 @@ Step 1 — start inference server (separate terminal, simplevla env):
 Step 2 — start training (AReaL venv):
     source .venv/bin/activate
     python examples/robot/libero_rl.py \
-        examples/robot/conf/libero_grpo.yaml \
-        inference_server_address=tcp://localhost:5556 \
-        benchmark=libero_spatial
+        examples/robot/conf/libero_grpo.yaml
 """
 
 import sys
-from dataclasses import dataclass, field
 
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
@@ -40,47 +29,38 @@ from areal.dataset.robot_dataset import (
 )
 
 
-@dataclass
-class VLAGRPOConfig(GRPOConfig):
-    """GRPOConfig extended with VLA-specific fields."""
-    # Benchmark / environment
-    benchmark: str = "libero_spatial"
-    n_seeds_per_task: int = 5
-    val_fraction: float = 0.1
-    seed: int = 42
-
-    # Inference server (simplevla env ZMQ process)
-    inference_server_address: str = "tcp://localhost:5556"
-
-    # Episode hyperparameters — verified from shell script
-    action_chunks_len: int = 8     # actor_rollout_ref.model.action_chunks_len=8
-    max_episode_steps: int = 512   # rob_rollout.py LIBERO max_steps dict
-    unnorm_key: str = "libero_spatial_no_noops"
-
-
 def main(args):
-    config, _ = load_expr_config(args, VLAGRPOConfig)
+    config, _ = load_expr_config(args, GRPOConfig)
+
+    # VLA-specific fields come from the YAML (accessed via getattr with defaults)
+    benchmark      = getattr(config, "benchmark", "libero_spatial")
+    n_seeds        = getattr(config, "n_seeds_per_task", 5)
+    val_fraction   = getattr(config, "val_fraction", 0.1)
+    seed           = getattr(config, "seed", 42)
+    server_address = getattr(config, "inference_server_address", "tcp://localhost:5556")
+    action_chunks  = getattr(config, "action_chunks_len", 8)
+    max_steps      = getattr(config, "max_episode_steps", 512)
+    unnorm_key     = getattr(config, "unnorm_key", "libero_spatial_no_noops")
 
     all_specs = build_task_specs_from_libero_env(
-        benchmark_name=config.benchmark,
-        n_seeds=config.n_seeds_per_task,
+        benchmark_name=benchmark,
+        n_seeds=n_seeds,
     )
     train_specs, val_specs = split_train_val(
         all_specs,
-        val_fraction=config.val_fraction,
-        seed=config.seed,
+        val_fraction=val_fraction,
+        seed=seed,
     )
     train_dataset = RobotTaskDataset(train_specs)
     valid_dataset = RobotTaskDataset(val_specs)
 
     workflow_kwargs = dict(
-        server_address=config.inference_server_address,
-        benchmark=config.benchmark,
-        action_chunks_len=config.action_chunks_len,
-        max_episode_steps=config.max_episode_steps,
-        unnorm_key=config.unnorm_key,
+        server_address=server_address,
+        benchmark=benchmark,
+        action_chunks_len=action_chunks,
+        max_episode_steps=max_steps,
+        unnorm_key=unnorm_key,
     )
-    # Eval uses greedy decoding (do_sample=False) — same kwargs for now
     eval_workflow_kwargs = workflow_kwargs.copy()
 
     with PPOTrainer(
