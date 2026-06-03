@@ -35,7 +35,7 @@ cluster:
   n_gpus_per_node: 8
 
 scheduler:
-  type: null
+  type: local
   endpoint: http://localhost:8081
   deploy_mode: separation
   functioncall_service_domain: http://localhost:8080
